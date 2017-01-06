@@ -4,8 +4,10 @@ import java.io.Serializable;
 import java.math.BigDecimal;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map.Entry;
 
 import javax.persistence.EntityManager;
@@ -19,6 +21,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.domain.Sort.Direction;
@@ -33,6 +36,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.senomas.claypot.model.ModelRepository;
 import com.senomas.common.rs.ResourceNotFoundException;
 
@@ -41,10 +46,10 @@ public abstract class ModelRestService<T, K extends Serializable> {
 
 	@Autowired
 	ModelRepository<T, K> repo;
-	
+
 	@Autowired
 	EntityManager em;
-	
+
 	private final String modelName;
 	private final Class<T> modelType;
 
@@ -53,60 +58,51 @@ public abstract class ModelRestService<T, K extends Serializable> {
 		this.modelType = modelType;
 	}
 
-	@RequestMapping(value = "/list", method = RequestMethod.GET)
-	@Transactional
-	public Page<T> getList(@RequestParam(name = "page", defaultValue = "0") int page,
-			@RequestParam(name = "limit", defaultValue = "10") int pageSize,
-			@RequestParam(name = "sort", required = false) String sort,
-			@RequestParam(name = "ascending", defaultValue = "true") boolean ascending) throws Exception {
-		PageRequest pageReq;
-		if (sort != null) {
-			pageReq = new PageRequest(page, pageSize,
-					new Sort(new Order(ascending ? Direction.ASC : Direction.DESC, sort)));
-		} else {
-			pageReq = new PageRequest(page, pageSize);
-		}
-		return repo.findAll(pageReq);
-	}
-
 	@SuppressWarnings("unchecked")
 	@RequestMapping(value = "/list", method = RequestMethod.POST, consumes = "application/json")
 	@Transactional
-	public Page<T> getListWithFilter(@RequestParam(name = "page", defaultValue = "0") int page,
+	public Page<?> getListWithFilter(@RequestParam(name = "page", defaultValue = "0") int page,
 			@RequestParam(name = "limit", defaultValue = "10") int pageSize,
 			@RequestParam(name = "sort", required = false) String sort,
 			@RequestParam(name = "ascending", defaultValue = "true") boolean ascending,
-			@RequestBody(required = false) String filterString) throws Exception {
+			@RequestBody(required = false) String param) throws Exception {
 		Specifications<T> specs = null;
-		if (filterString != null) {
+		ArrayNode fields = null;
+		if (param != null) {
 			ObjectMapper om = new ObjectMapper();
-			JsonNode filter = om.readTree(filterString);
-			for (Iterator<Entry<String, JsonNode>> itr = filter.fields(); itr.hasNext();) {
-				Entry<String, JsonNode> fi = itr.next();
-				String fin = fi.getKey();
-				Specification<T> spec;
-				try {
-					spec = (Specification<T>) getClass()
-							.getMethod("filter" + fin.substring(0, 1).toUpperCase() + fin.substring(1), JsonNode.class)
-							.invoke(this, fi.getValue());
-				} catch (NoSuchMethodException e) {
-					Class<?> ftype = em.getMetamodel().entity(modelType).getAttribute(fin).getJavaType();
-					if (String.class.isAssignableFrom(ftype)) {
-						spec = filterString(fin, fi.getValue());
-					} else if (Date.class.isAssignableFrom(ftype)) {
-						spec = filterDate(fin, fi.getValue());
-					} else if (Number.class.isAssignableFrom(ftype)) {
-						spec = filterNumber(fin, fi.getValue());
+			JsonNode po = om.readTree(param);
+			if (po.has("filter")) {
+				for (Iterator<Entry<String, JsonNode>> itr = po.get("filter").fields(); itr.hasNext();) {
+					Entry<String, JsonNode> fi = itr.next();
+					String fin = fi.getKey();
+					Specification<T> spec;
+					try {
+						spec = (Specification<T>) getClass()
+								.getMethod("filter" + fin.substring(0, 1).toUpperCase() + fin.substring(1),
+										JsonNode.class)
+								.invoke(this, fi.getValue());
+					} catch (NoSuchMethodException e) {
+						Class<?> ftype = em.getMetamodel().entity(modelType).getAttribute(fin).getJavaType();
+						if (String.class.isAssignableFrom(ftype)) {
+							spec = filterString(fin, fi.getValue());
+						} else if (Date.class.isAssignableFrom(ftype)) {
+							spec = filterDate(fin, fi.getValue());
+						} else if (Number.class.isAssignableFrom(ftype)) {
+							spec = filterNumber(fin, fi.getValue());
+						} else {
+							log.warn(e.getMessage(), e);
+							throw new RuntimeException("'" + modelName + "' not support field '" + fin + "'");
+						}
+					}
+					if (specs == null) {
+						specs = Specifications.where(spec);
 					} else {
-						log.warn(e.getMessage(), e);
-						throw new RuntimeException("'"+modelName+"' not support field '" + fin + "'");
+						specs = specs.and(spec);
 					}
 				}
-				if (specs == null) {
-					specs = Specifications.where(spec);
-				} else {
-					specs = specs.and(spec);
-				}
+			}
+			if (po.has("fields")) {
+				fields = (ArrayNode) po.get("fields");
 			}
 		}
 		PageRequest pageReq;
@@ -116,10 +112,22 @@ public abstract class ModelRestService<T, K extends Serializable> {
 		} else {
 			pageReq = new PageRequest(page, pageSize);
 		}
+		Page<T> res;
 		if (specs != null) {
-			return repo.findAll(specs, pageReq);
+			res = repo.findAll(specs, pageReq);
+		} else {
+			res = repo.findAll(pageReq);
 		}
-		return repo.findAll(pageReq);
+		if (fields != null) {
+			List<Json> content = new ArrayList<>(res.getSize());
+			ObjectMapper om = new ObjectMapper();
+			for (T e : res.getContent()) {
+				JsonNode ov = filter(om, fields, om.convertValue(e, JsonNode.class));
+				content.add(new Json(om.writeValueAsString(ov)));
+			}
+			return new PageImpl<Json>(content, pageReq, res.getTotalElements());
+		}
+		return res;
 	}
 
 	@RequestMapping(value = "/{id}", method = { RequestMethod.GET })
@@ -127,7 +135,25 @@ public abstract class ModelRestService<T, K extends Serializable> {
 	public T getById(@PathVariable("id") K id) {
 		T obj = repo.findOne(id);
 		if (obj == null)
-			throw new ResourceNotFoundException("Object '"+modelName+"' with id '" + id + "' not found.");
+			throw new ResourceNotFoundException("Object '" + modelName + "' with id '" + id + "' not found.");
+		return obj;
+	}
+
+	@RequestMapping(value = "/{id}", method = RequestMethod.POST, consumes = "application/json")
+	@Transactional
+	public Object getByIdWithFields(@PathVariable("id") K id, @RequestBody(required = false) String fields)
+			throws Exception {
+		T obj = repo.findOne(id);
+		if (obj == null)
+			throw new ResourceNotFoundException("Object '" + modelName + "' with id '" + id + "' not found.");
+		if (fields != null) {
+			ObjectMapper om = new ObjectMapper();
+			JsonNode of = om.readTree(fields);
+			if (of.isArray()) {
+				JsonNode ov = filter(om, (ArrayNode) of, om.convertValue(obj, JsonNode.class));
+				return new Json(om.writeValueAsString(ov));
+			}
+		}
 		return obj;
 	}
 
@@ -142,9 +168,34 @@ public abstract class ModelRestService<T, K extends Serializable> {
 	public T delete(@PathVariable("id") K id) {
 		T obj = repo.findOne(id);
 		if (obj == null)
-			throw new ResourceNotFoundException("Object '"+modelName+"' with id '" + id + "' not found.");
+			throw new ResourceNotFoundException("Object '" + modelName + "' with id '" + id + "' not found.");
 		repo.delete(id);
 		return obj;
+	}
+
+	public static JsonNode filter(ObjectMapper om, ArrayNode fields, JsonNode object) {
+		if (object.isArray()) {
+			ArrayNode an = om.createArrayNode();
+			for (int i = 0, il = object.size(); i < il; i++) {
+				an.add(filter(om, fields, object.get(i)));
+			}
+			return an;
+		} else if (object.isObject()) {
+			ObjectNode on = om.createObjectNode();
+			for (int i = 0, il = fields.size(); i < il; i++) {
+				JsonNode f = fields.get(i);
+				if (f.isObject()) {
+					// TODO NESTED
+				} else {
+					String fn = f.asText();
+					if (object.has(fn)) {
+						on.set(fn, object.get(fn));
+					}
+				}
+			}
+			return on;
+		}
+		return object;
 	}
 
 	public static <T> Specification<T> filterString(String field, JsonNode param) {
@@ -158,7 +209,7 @@ public abstract class ModelRestService<T, K extends Serializable> {
 					if (param.has("like")) {
 						return cb.like(root.get(field), param.get("like").asText());
 					}
-					throw new RuntimeException("Not supported "+param);
+					throw new RuntimeException("Not supported " + param);
 				}
 				return cb.like(root.get(field), param.asText());
 			}
