@@ -1,4 +1,3 @@
-// src/components/About/index.js
 import React, { PropTypes, Component } from 'react';
 import classnames from 'classnames';
 

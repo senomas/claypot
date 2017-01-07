@@ -3,6 +3,7 @@ import React from 'react';
 import { Router, Route } from 'react-router';
 
 import App from './components/App';
+import BlogList from './components/BlogList';
 import About from './components/About';
 import NotFound from './components/NotFound';
 
